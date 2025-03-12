@@ -34,3 +34,5 @@ redis==5.0.1  # For caching (optional)
 
 # Ngrok
 pyngrok
+
+numpy

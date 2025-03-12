@@ -2,14 +2,16 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, Body
 from sqlalchemy.orm import Session
 import logging
 import json
-import traceback
 from datetime import datetime
 import asyncio
+import traceback
 
 from app.db.database import get_db
 from app.db.models import Conversation, ConversationTurn, Order, ErrorLog
 from app.services.twilio_service import twilio_service
 from app.services.llm_service import llm_service
+from app.services.rag_service import rag_service
+from app.services.speech_enhancement_service import speech_enhancement_service
 from app.utils.helpers import parse_phone_number, parse_datetime
 from app.config import settings
 
@@ -28,254 +30,168 @@ async def incoming_call(request: Request, db: Session = Depends(get_db)):
     # Normalize phone number
     customer_phone = parse_phone_number(from_number)
     
-    # Check for existing conversations/orders for this customer
-    existing_orders = db.query(Order).filter(
-        Order.customer_phone == customer_phone,
-        Order.status.in_(["confirmed", "modified"])
-    ).order_by(Order.created_at.desc()).first()
-    
     # Create a new conversation record
     new_conversation = Conversation(
         call_sid=call_sid,
         customer_phone=customer_phone,
         conversation_log=json.dumps([]),
-        order_id=existing_orders.id if existing_orders else None
+        order_id=None
     )
     db.add(new_conversation)
     db.commit()
     
-    # Get custom greeting based on whether they have existing orders
-    greeting = "Thank you for calling Mario's Italian Restaurant. This is Mario's virtual assistant."
+    # Language selection prompt
+    language_prompt = f"Thank you for calling {settings.RESTAURANT_NAME}. Press 1 for English or press 2 for Urdu."
     
-    if existing_orders:
-        greeting += f" I see you have an existing order with us. How can I help you today?"
-    else:
-        greeting += " How can I help you today?"
+    # Create TwiML response with language selection options
+    response = twilio_service.create_language_selection_response(language_prompt)
     
-    # Create TwiML response
-    twiml_response = twilio_service.create_twiml_response(greeting)
-    
-    return Response(content=twiml_response, media_type="application/xml")
+    return Response(content=response, media_type="application/xml")
 
-@router.post("/process-speech")
-async def process_speech(request: Request, db: Session = Depends(get_db)):
-    """Process customer speech and generate a response."""
-    try:
-        form_data = await request.form()
-        call_sid = form_data.get("CallSid")
-        speech_result = form_data.get("SpeechResult")
-        confidence = float(form_data.get("Confidence", 0))
-        
-        if not speech_result:
-            logger.warning(f"No speech detected for call {call_sid}")
-            twiml_response = twilio_service.create_twiml_response(
-                "I'm sorry, I didn't catch that. Could you please repeat?"
-            )
-            return Response(content=twiml_response, media_type="application/xml")
-        
-        # Find the conversation record
-        conversation = db.query(Conversation).filter(Conversation.call_sid == call_sid).first()
-        if not conversation:
-            logger.error(f"Conversation not found for call {call_sid}")
-            twiml_response = twilio_service.create_twiml_response(
-                "I'm sorry, I'm having trouble with this call. Let me transfer you to a staff member."
-            )
-            return Response(content=twiml_response, media_type="application/xml")
-        
-        # Load conversation history
-        try:
-            conversation_history = json.loads(conversation.conversation_log)
-        except json.JSONDecodeError:
-            conversation_history = []
-        
-        # Classify intent
-        intent = await llm_service.classify_intent(speech_result)
-        
-        # Add customer's speech to conversation history
-        conversation_history.append({"customer": speech_result})
-        
-        # Create a new conversation turn record for customer
-        new_turn = ConversationTurn(
-            conversation_id=conversation.id,
-            sequence=len(conversation_history),
-            speaker="customer",
-            content=speech_result,
-            intent=intent
-        )
-        db.add(new_turn)
-        
-        # Handle special intents
-        if intent == "end_call":
-            response_text = "Thank you for calling Mario's Italian Restaurant. Have a great day!"
-            twiml_response = twilio_service.create_goodbye_response(response_text)
-            
-            # Update conversation record with end time
-            conversation.ended_at = datetime.utcnow()
-            conversation.conversation_log = json.dumps(conversation_history)
-            db.commit()
-            
-            return Response(content=twiml_response, media_type="application/xml")
-        
-        # Load existing order data if available
-        order_data = None
-        if conversation.order_id:
-            order = db.query(Order).filter(Order.id == conversation.order_id).first()
-            if order:
-                order_data = {
-                    "id": order.id,
-                    "customer_name": order.customer_name,
-                    "order_items": json.loads(order.order_items),
-                    "is_delivery": order.is_delivery,
-                    "status": order.status
-                }
-        
-        # Generate AI response
-        start_time = datetime.utcnow()
-        ai_response = await llm_service.generate_response(speech_result, conversation_history, order_data)
-        latency = (datetime.utcnow() - start_time).total_seconds() * 1000  # ms
-        
-        # Update conversation history with assistant's response
-        conversation_history[-1]["assistant"] = ai_response
-        
-        # Create a new conversation turn record for assistant
-        assistant_turn = ConversationTurn(
-            conversation_id=conversation.id,
-            sequence=len(conversation_history),
-            speaker="assistant",
-            content=ai_response,
-            latency=latency
-        )
-        db.add(assistant_turn)
-        
-        # Update conversation log
-        conversation.conversation_log = json.dumps(conversation_history)
-        db.commit()
-        
-        # Process new orders if intent is new_order
-        if intent == "new_order" and not conversation.order_id:
-            # Parse order details from conversation
-            order_details = await llm_service.parse_order_details(speech_result, conversation_history)
-            
-            # Only create order if we have meaningful data
-            if order_details.get("order_items") or order_details.get("reservation_time"):
-                new_order = Order(
-                    customer_name=order_details.get("customer_name", "Unknown"),
-                    customer_phone=conversation.customer_phone,
-                    order_items=json.dumps(order_details.get("order_items", [])),
-                    is_delivery=order_details.get("is_delivery", False),
-                    delivery_address=order_details.get("address"),
-                    reservation_time=parse_datetime(order_details.get("reservation_time")),
-                    party_size=order_details.get("party_size")
-                )
-                db.add(new_order)
-                db.commit()
-                
-                # Link order to conversation
-                conversation.order_id = new_order.id
-                db.commit()
-        
-        # Create TwiML response
-        twiml_response = twilio_service.create_twiml_response(ai_response)
-        
-        return Response(content=twiml_response, media_type="application/xml")
-        
-    except Exception as e:
-        logger.error(f"Error processing speech: {str(e)}")
-        
-        # Log the error
-        try:
-            error_log = ErrorLog(
-                call_sid=form_data.get("CallSid") if 'form_data' in locals() else None,
-                error_type=type(e).__name__,
-                error_message=str(e),
-                stack_trace=traceback.format_exc(),
-                error_metadata=json.dumps({"url": str(request.url)})
-            )
-            db.add(error_log)
-            db.commit()
-        except:
-            pass
-        
-        # Fallback response
-        twiml_response = twilio_service.create_twiml_response(
-            "I'm sorry, I encountered an error. Let me transfer you to a staff member who can help."
-        )
-        return Response(content=twiml_response, media_type="application/xml")
-
-@router.post("/handle-no-input")
-async def handle_no_input(request: Request, db: Session = Depends(get_db)):
-    """Handle cases where no input is received from the customer."""
+@router.post("/handle-language")
+async def handle_language_selection(request: Request, db: Session = Depends(get_db)):
+    """Handle language selection."""
     form_data = await request.form()
     call_sid = form_data.get("CallSid")
-    
-    logger.info(f"No input received for call {call_sid}")
+    digits_pressed = form_data.get("Digits")
     
     # Find the conversation record
     conversation = db.query(Conversation).filter(Conversation.call_sid == call_sid).first()
     if not conversation:
-        # Fallback if conversation not found
+        logger.error(f"Conversation not found for call {call_sid}")
         twiml_response = twilio_service.create_twiml_response(
-            "I didn't hear anything. Can I help you with anything today?"
+            "I'm sorry, I'm having trouble with this call. Please try again later."
         )
         return Response(content=twiml_response, media_type="application/xml")
     
-    # Get conversation history
+    # Get language based on digits pressed
+    language = "en-US"  # Default to English
+    if digits_pressed == "2":
+        language = "ur-PK"  # Urdu
+    
+    # Store language preference in conversation metadata
     try:
         conversation_history = json.loads(conversation.conversation_log)
     except json.JSONDecodeError:
         conversation_history = []
     
-    # Check if this is repeated no-input
-    no_input_count = db.query(ConversationTurn).filter(
-        ConversationTurn.conversation_id == conversation.id,
-        ConversationTurn.content == "NO_INPUT"
-    ).count()
-    
-    if no_input_count >= 2:
-        # After multiple no-inputs, end the call politely
-        twiml_response = twilio_service.create_goodbye_response(
-            "I haven't heard a response. Thank you for calling Mario's Italian Restaurant. Feel free to call back anytime!"
-        )
-        
-        # Update conversation record with end time
-        conversation.ended_at = datetime.utcnow()
-        db.commit()
-        
-        return Response(content=twiml_response, media_type="application/xml")
-    
-    # Add a no-input marker to conversation turns
-    new_turn = ConversationTurn(
-        conversation_id=conversation.id,
-        sequence=len(conversation_history) + 1 if conversation_history else 1,
-        speaker="customer",
-        content="NO_INPUT"
-    )
-    db.add(new_turn)
+    # Add language selection to conversation metadata
+    conversation_history.append({"system": f"Language selected: {language}"})
+    conversation.conversation_log = json.dumps(conversation_history)
     db.commit()
     
-    # Generate appropriate prompt based on no-input count
-    if no_input_count == 0:
-        response = "I didn't hear anything. Can I help you with an order or reservation today?"
-    else:
-        response = "I still don't hear anything. If you're there, please speak now, or I'll end the call."
+    # Check for existing orders for this customer
+    existing_orders = db.query(Order).filter(
+        Order.customer_phone == conversation.customer_phone,
+        Order.status.in_(["confirmed", "modified"])
+    ).order_by(Order.created_at.desc()).first()
     
-    twiml_response = twilio_service.create_twiml_response(response)
+    # Update conversation with order info if available
+    if existing_orders:
+        conversation.order_id = existing_orders.id
+        db.commit()
+    
+    # Get personalized greeting based on customer status and language
+    if language == "en-US":
+        if existing_orders:
+            greeting = f"Welcome back to {settings.RESTAURANT_NAME}. I see you have an existing order with us. How can I help you today?"
+        else:
+            greeting = f"Welcome to {settings.RESTAURANT_NAME}. How can I help you today? You can ask about our menu, place an order, or make a reservation."
+    else:  # Urdu
+        if existing_orders:
+            greeting = f"{settings.RESTAURANT_NAME} میں دوبارہ خوش آمدید۔ میں دیکھ رہا ہوں کہ آپ کا ایک موجودہ آرڈر ہے۔ میں آج آپ کی کیسے مدد کر سکتا ہوں؟"
+        else:
+            greeting = f"{settings.RESTAURANT_NAME} میں خوش آمدید۔ میں آپ کی کیسے مدد کر سکتا ہوں؟ آپ ہمارے مینو کے بارے میں پوچھ سکتے ہیں، آرڈر دے سکتے ہیں، یا ریزرویشن کر سکتے ہیں۔"
+    
+    # Create TwiML response
+    twiml_response = twilio_service.create_twiml_response(greeting, voice_language=language)
+    
     return Response(content=twiml_response, media_type="application/xml")
 
-@router.post("/call", status_code=201)
-async def initiate_call(
-    phone_number: str = Body(..., embed=True),
-    db: Session = Depends(get_db)
-):
-    """Initiate an outbound call to a customer."""
+
+# In app/api/voice.py
+# Make sure you add this route handler
+
+@router.post("/handle-language")
+async def handle_language_selection(request: Request, db: Session = Depends(get_db)):
+    """Handle language selection."""
+    form_data = await request.form()
+    call_sid = form_data.get("CallSid")
+    digits_pressed = form_data.get("Digits")
+    
+    # Find the conversation record
+    conversation = db.query(Conversation).filter(Conversation.call_sid == call_sid).first()
+    if not conversation:
+        logger.error(f"Conversation not found for call {call_sid}")
+        twiml_response = twilio_service.create_twiml_response(
+            "I'm sorry, I'm having trouble with this call. Please try again later."
+        )
+        return Response(content=twiml_response, media_type="application/xml")
+    
+    # Get language based on digits pressed - Default to English for safety
+    language = "en-US"
+    if digits_pressed == "2":
+        language = "en-US"  # Temporarily set to English until we fix Urdu issues
+    
+    # Store language preference in conversation metadata
     try:
-        # Normalize phone number
-        formatted_number = parse_phone_number(phone_number)
-        
-        # Initiate call via Twilio
-        call_sid = twilio_service.make_call(formatted_number)
-        
-        return {"status": "success", "call_sid": call_sid}
-    except Exception as e:
-        logger.error(f"Failed to initiate call: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to initiate call: {str(e)}")
+        conversation_history = json.loads(conversation.conversation_log)
+    except json.JSONDecodeError:
+        conversation_history = []
+    
+    # Add language selection to conversation metadata
+    conversation_history.append({"system": f"Language selected: {language}"})
+    conversation.conversation_log = json.dumps(conversation_history)
+    db.commit()
+    
+    # Check for existing orders for this customer
+    existing_orders = db.query(Order).filter(
+        Order.customer_phone == conversation.customer_phone,
+        Order.status.in_(["confirmed", "modified"])
+    ).order_by(Order.created_at.desc()).first()
+    
+    # Update conversation with order info if available
+    if existing_orders:
+        conversation.order_id = existing_orders.id
+        db.commit()
+    
+    # Get personalized greeting - For now use English regardless of selection
+    if existing_orders:
+        greeting = f"Welcome back to {settings.RESTAURANT_NAME}. I see you have an existing order with us. How can I help you today?"
+    else:
+        greeting = f"Welcome to {settings.RESTAURANT_NAME}. How can I help you today? You can ask about our menu, place an order, or make a reservation."
+    
+    # Create TwiML response - Force English language for now
+    twiml_response = twilio_service.create_twiml_response(greeting, voice_language="en-US")
+    
+    return Response(content=twiml_response, media_type="application/xml")
+# Handle order status checks
+async def handle_order_status_check(conversation, db):
+    """Handle order status check intent."""
+    if not conversation.order_id:
+        return "I don't see any active orders for your phone number. Would you like to place a new order?"
+    
+    order = db.query(Order).filter(Order.id == conversation.order_id).first()
+    if not order:
+        return "I'm having trouble finding your order details. Please call back in a few minutes or speak with a staff member."
+    
+    # Generate response based on order status
+    if order.status == "confirmed":
+        eta_text = ""
+        if order.is_delivery:
+            eta_text = " Your delivery should arrive within 30-45 minutes."
+        else:
+            eta_text = " Your order should be ready for pickup in 15-20 minutes."
+            
+        return f"Your order has been confirmed and is being prepared.{eta_text} The order total is ${order.order_total/100:.2f}."
+    
+    elif order.status == "modified":
+        return f"Your order has been modified as requested. The updated total is ${order.order_total/100:.2f}."
+    
+    elif order.status == "cancelled":
+        return "Your order has been cancelled. Is there anything else I can help you with?"
+    
+    elif order.status == "completed":
+        return "Your order has been completed. We hope you enjoyed your meal! Would you like to place a new order?"
+    
+    return f"Your order status is: {order.status}. Is there anything specific you'd like to know about your order?"

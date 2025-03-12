@@ -1,6 +1,7 @@
 import openai
 import json
 import logging
+import random
 from tenacity import retry, stop_after_attempt, wait_exponential
 import time
 import asyncio
@@ -16,16 +17,37 @@ client = openai.Client(api_key=settings.OPENAI_API_KEY)
 class LLMService:
     def __init__(self):
         self.max_retries = settings.MAX_RETRIES
-        # Using models confirmed to work based on the test results
-        self.default_model = "gpt-3.5-turbo"  # Base model that works
-        self.conversation_model = "gpt-4"  # Using the more powerful model for conversations
+        # Use faster models for intent classification and simple responses
+        self.default_model = "gpt-3.5-turbo"  # Fast model for intents and basic responses
+        self.conversation_model = "gpt-3.5-turbo"  # Use this instead of gpt-4 for faster responses
+        # Only use gpt-4 for complex order understanding
+        self.order_model = "gpt-4"  # Keep the more advanced model just for order parsing
         self.intent_system_prompt = settings.INTENT_SYSTEM_PROMPT
         self.conversation_system_prompt = settings.CONVERSATION_SYSTEM_PROMPT
         self.order_parser_system_prompt = settings.ORDER_PARSER_SYSTEM_PROMPT
+        self.client = client  # Expose the client for use by other services
+        
+        # Add response cache
+        self.response_cache = {}
+        self.intent_cache = {}
         
         # Log model usage for debugging
-        logger.info(f"Using models - default: {self.default_model}, conversation: {self.conversation_model}")
+        logger.info(f"Using models - default: {self.default_model}, conversation: {self.conversation_model}, order: {self.order_model}")
     
+    async def process_in_parallel(self, speech_result, conversation_history, order_data):
+        """Process intent and response in parallel for faster results."""
+        # Start both operations concurrently
+        intent_task = asyncio.create_task(
+            self.classify_intent(speech_result)
+        )
+        response_task = asyncio.create_task(
+            self.generate_response(speech_result, conversation_history, order_data)
+        )
+        
+        # Wait for both to complete
+        intent, response = await asyncio.gather(intent_task, response_task)
+        
+        return intent, response
     
     @retry(
         stop=stop_after_attempt(3),
@@ -42,6 +64,24 @@ class LLMService:
         Returns:
             str: The classified intent
         """
+        # Check cache first
+        cache_key = transcript.lower().strip()
+        if cache_key in self.intent_cache:
+            return self.intent_cache[cache_key]
+        
+        # Check for common intents based on simple keyword matching
+        if any(word in cache_key for word in ['bye', 'goodbye', 'thank', 'hang up', 'end']):
+            self.intent_cache[cache_key] = "end_call"
+            return "end_call"
+        
+        if any(word in cache_key for word in ['order', 'pizza', 'food', 'menu']):
+            self.intent_cache[cache_key] = "new_order"
+            return "new_order"
+            
+        if any(word in cache_key for word in ['reserve', 'reservation', 'book', 'table']):
+            self.intent_cache[cache_key] = "reservation"
+            return "reservation"
+        
         start_time = time.time()
         
         try:
@@ -59,6 +99,9 @@ class LLMService:
             intent = response.choices[0].message.content.strip().lower()
             processing_time = time.time() - start_time
             logger.debug(f"Intent classification completed in {processing_time:.2f}s: {intent}")
+            
+            # Cache the intent for future use
+            self.intent_cache[cache_key] = intent
             
             return intent
         
@@ -89,6 +132,17 @@ class LLMService:
         Returns:
             str: The generated response
         """
+        # Check cache first for common queries
+        cache_key = transcript.lower().strip()
+        if cache_key in self.response_cache:
+            return self.response_cache[cache_key]
+            
+        # Check for common questions and provide instant responses
+        for key, response in settings.COMMON_RESPONSES.items():
+            if key in cache_key:
+                self.response_cache[cache_key] = response
+                return response
+        
         start_time = time.time()
         
         # Prepare messages including conversation history
@@ -96,8 +150,11 @@ class LLMService:
             {"role": "system", "content": self.conversation_system_prompt}
         ]
         
+        # Limit conversation history to last 5 exchanges to reduce token usage
+        recent_history = conversation_history[-5:] if len(conversation_history) > 5 else conversation_history
+        
         # Add conversation history
-        for exchange in conversation_history:
+        for exchange in recent_history:
             if "customer" in exchange:
                 messages.append({"role": "user", "content": exchange["customer"]})
             if "assistant" in exchange and exchange.get("assistant"):
@@ -116,13 +173,17 @@ class LLMService:
             response = client.chat.completions.create(
                 model=self.conversation_model,
                 messages=messages,
-                max_tokens=150,
+                max_tokens=100,  # Reduced token length for faster response
                 temperature=0.7
             )
             
             ai_response = response.choices[0].message.content
             processing_time = time.time() - start_time
             logger.debug(f"Response generation completed in {processing_time:.2f}s")
+            
+            # Cache the response for future use (only for simple queries)
+            if len(transcript.split()) < 8:  # Cache only simple queries
+                self.response_cache[cache_key] = ai_response
             
             return ai_response
         
@@ -163,8 +224,9 @@ class LLMService:
         full_conversation += f"Customer: {transcript}"
         
         try:
+            # Use the advanced model for order parsing
             response = client.chat.completions.create(
-                model=self.conversation_model,
+                model=self.order_model,
                 messages=[
                     {"role": "system", "content": self.order_parser_system_prompt},
                     {"role": "user", "content": full_conversation}
